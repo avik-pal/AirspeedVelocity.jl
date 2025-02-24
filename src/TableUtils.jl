@@ -1,11 +1,12 @@
 module TableUtils
 
-using ..Utils: get_reasonable_unit
+using ..Utils:
+    get_reasonable_time_unit, get_reasonable_allocs_unit, get_reasonable_memory_unit
 using OrderedCollections: OrderedDict
 using Printf: @sprintf
 
 function format_time(val::Dict)
-    unit, unit_name = get_reasonable_unit([val["median"]])
+    unit, unit_name = get_reasonable_time_unit([val["median"]])
     if haskey(val, "75")
         @sprintf(
             "%.3g ± %.2g %s",
@@ -18,8 +19,43 @@ function format_time(val::Dict)
     end
 end
 function format_time(val::Number)
-    unit, unit_name = get_reasonable_unit([val])
+    unit, unit_name = get_reasonable_memory_unit([val])
     @sprintf("%.3g %s", val * unit, unit_name)
+end
+function format_time(::Missing)
+    return ""
+end
+
+function format_memory(val::Dict)
+    allocs, memory = get(val, "allocs", nothing), get(val, "memory", nothing)
+    if !isnothing(allocs) && !isnothing(memory)
+        allocs_unit, allocs_unit_name = get_reasonable_allocs_unit(val["allocs"])
+        memory_unit, memory_unit_name = get_reasonable_memory_unit(val["memory"])
+        @sprintf(
+            "%.3g %s allocs: %.3g %s",
+            allocs * allocs_unit,
+            allocs_unit_name,
+            memory * memory_unit,
+            memory_unit_name
+        )
+    else
+        ""
+    end
+end
+function format_memory(::Missing)
+    return ""
+end
+
+function default_formatter(key)
+    if key ∉ ("median", "memory")
+        error("Unknown ratio column: $key")
+    end
+
+    if key == "memory"
+        return format_memory
+    else # if key == "median"
+        return format_time
+    end
 end
 
 """
@@ -29,52 +65,75 @@ Create a markdown table of the results loaded from the `load_results` function.
 If there are two results for a given benchmark, will have an additional column
 for the comparison, assuming the first revision is one to compare against.
 
+The `formatter` keyword argument generates the column value. It defaults to
+`TableUtils.format_time`, which prints the median time ± the interquantile range.
+`TableUtils.format_memory` is also available to print the number of allocations
+and the allocated memory.
 """
-function create_table(combined_results::OrderedDict; add_ratio_col=true)
+function create_table(
+    combined_results::OrderedDict;
+    key="median",
+    add_ratio_col=true,
+    formatter=default_formatter(key),
+)
     num_revisions = length(combined_results)
     num_cols = 1 + num_revisions
+    # Order keys based on first result:
+    all_keys = [keys(first(values(combined_results)))...]
 
-    headers = [[""]; keys(combined_results) .|> string]
+    # But, make sure we have all keys:
+    for extra_key in union([keys(v) for v in values(combined_results)]...)
+        if !in(extra_key, all_keys)
+            push!(all_keys, extra_key)
+        end
+    end
+
+    # Always put `time_to_load` at bottom:
+    if in("time_to_load", all_keys)
+        deleteat!(all_keys, findfirst(==("time_to_load"), all_keys))
+        push!(all_keys, "time_to_load")
+    end
+
+    headers = String["", string.(keys(combined_results))...]
+
+    # Cutoff headers if needed:
     cutoff = 14
-    headers = [
+    headers = String[
         if length(head) <= cutoff
             head
         else
-            head[1:cutoff] * "..."
+            first(head, cutoff) * "..."
         end for head in headers
     ]
 
-    data = Vector{String}[]
+    data_columns = Vector{String}[]
 
-    # Each benchmark:
-    for (_, result) in combined_results
-        push!(data, keys(result) .|> string)
-        break
-    end
-
-    # Data:
-    for (_, result) in combined_results
-        col = []
-        for row in data[1]
-            val = result[row]
-            push!(col, format_time(val))
+    for result in values(combined_results)
+        col = String[]
+        for row in all_keys
+            val = get(result, row, missing)
+            push!(col, formatter(val))
         end
-        push!(data, col)
+        push!(data_columns, col)
     end
 
     if num_revisions == 2 && add_ratio_col
-        col = []
-        for row in data[1]
-            ratio = (/)([val[row]["median"] for val in values(combined_results)]...)
-            push!(col, @sprintf("%.3g", ratio))
+        col = String[]
+        for row in all_keys
+            if all(r -> haskey(r, row), values(combined_results))
+                ratio = (/)([val[row][key] for val in values(combined_results)]...)
+                push!(col, @sprintf("%.3g", ratio))
+            else
+                push!(col, "")
+            end
         end
-        push!(data, col)
-        push!(headers, "t[$(headers[2])]/t[$(headers[3])]")
+        push!(data_columns, col)
+        push!(headers, "$(headers[2]) / $(headers[3])")
         num_cols += 1
     end
 
-    mdata = hcat(data...)
-    # With headers and data, let's make a markdown table with PrettyTables:
+    mdata = hcat(string.(all_keys), data_columns...)
+    # With headers and data, let's make a markdown table
     return markdown_table(; data=mdata, header=headers)
 end
 
@@ -88,7 +147,6 @@ function markdown_table(; data::AbstractMatrix, header::AbstractVector)
     end
     # GitHub-style markdown table:
     io = IOBuffer()
-    # println(io, "| $(join(header, " | ")) |")
     print(io, "|")
     for (i, head) in enumerate(header)
         print(io, " $(head) " * " "^(col_widths[i] - length(head)) * "|")
@@ -105,14 +163,13 @@ function markdown_table(; data::AbstractMatrix, header::AbstractVector)
 
     println(io)
     for row in eachrow(data)
-        # println(io, "| $(join(row, " | ")) |")
         print(io, "|")
         for (i, val) in enumerate(row)
             print(io, " $(val) " * " "^(col_widths[i] - length(string(val))) * "|")
         end
         println(io)
     end
-    return take!(io) |> String
+    return String(take!(io))
 end
 
 end # AirspeedVelocity.TableUtils
